@@ -105,6 +105,7 @@ class TemplateState:
 
     current_commitment: Optional[str] = None
     coinbase_aux: Optional[str] = None
+    payout_script: Optional[str] = None
 
     new_sessions: Set[RPCSession] = set()
     all_sessions: Set[RPCSession] = set()
@@ -411,9 +412,16 @@ async def stateUpdater(
                 txs_list: List = json_obj["result"].get("transactions", [])
                 coinbase_sats_int: int = int(json_obj["result"]["coinbasevalue"], 16) if isinstance(json_obj["result"]["coinbasevalue"], str) else json_obj["result"]["coinbasevalue"]
                 witness_hex: str = json_obj["result"].get("default_witness_commitment", "")
-                coinbase_aux_hex: str = json_obj["result"]["coinbaseaux"]
+                coinbase_aux_hex: str = json_obj["result"].get("coinbaseaux", "")
+                if not isinstance(coinbase_aux_hex, str):
+                    coinbase_aux_hex = ""
                 if coinbase_aux_hex.startswith("0x"):
                     coinbase_aux_hex = coinbase_aux_hex[2:]
+                payout_script_hex: str = json_obj["result"].get("payoutscript", "")
+                if not isinstance(payout_script_hex, str):
+                    payout_script_hex = ""
+                if payout_script_hex.startswith("0x"):
+                    payout_script_hex = payout_script_hex[2:]
                 target_hex: str = json_obj["result"]["target"]
                 if target_hex.startswith("0x"):
                     target_hex = target_hex[2:]
@@ -424,6 +432,8 @@ async def stateUpdater(
                 state.current_commitment = witness_hex
                 new_coinbase_aux = coinbase_aux_hex != state.coinbase_aux
                 state.coinbase_aux = coinbase_aux_hex
+                new_payout_script = payout_script_hex != state.payout_script
+                state.payout_script = payout_script_hex
                 state.target = target_hex
                 state.bits = bits_hex
                 state.version = version_int
@@ -484,7 +494,13 @@ async def stateUpdater(
                     state.height = height_int
 
                 # The following occurs during both new blocks & new txs & nothing happens for 60s (magic number)
-                if new_block or new_witness or new_coinbase_aux or state.timestamp + 60 < ts:
+                if (
+                    new_block
+                    or new_witness
+                    or new_coinbase_aux
+                    or new_payout_script
+                    or state.timestamp + 60 < ts
+                ):
                     # Generate coinbase #
 
                     if original_state is None:
@@ -500,7 +516,12 @@ async def stateUpdater(
                         bytes_needed_sub_1 + 1, "little"
                     )
 
+                    aux_data = bytes.fromhex(coinbase_aux_hex)
+                    # Clamp aux data to 100 bytes so we respect consensus coinbase limits.
+                    aux_data = aux_data[:100]
                     coinbase_script = op_push(len(bip34_height)) + bip34_height
+                    if aux_data:
+                        coinbase_script += op_push(len(aux_data)) + aux_data
                     coinbase_txin = (
                         bytes(32)
                         + b"\xff" * 4
@@ -508,15 +529,9 @@ async def stateUpdater(
                         + coinbase_script
                         + b"\xff" * 4
                     )
-                    # Treat coinbaseaux as a complete payout script when provided.
-                    # Fall back to a P2PKH script using the first miner address (or
-                    # zeros) so the subsidy always lands somewhere spendable.
-                    payout_script = None
-                    if coinbase_aux_hex:
-                        try:
-                            payout_script = bytes.fromhex(coinbase_aux_hex)
-                        except ValueError:
-                            payout_script = None
+
+                    payout_script = bytes.fromhex(payout_script_hex)
+
 
                     # Concerning the default_witness_commitment:
                     # https://github.com/bitcoin/bips/blob/master/bip-0141.mediawiki#commitment-structure

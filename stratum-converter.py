@@ -7,7 +7,15 @@ import os
 import urllib.parse
 
 import base58
-import sha3
+try:
+    import sha3
+except ImportError:
+    # Fallback to pycryptodome if pysha3 is not available
+    from Crypto.Hash import keccak as sha3_module
+    class sha3:
+        @staticmethod
+        def keccak_256():
+            return sha3_module.new(digest_bits=256)
 
 from aiohttp import ClientSession
 from aiorpcx import (
@@ -70,6 +78,36 @@ def merkle_from_txids(txids: List[bytes]):
         txids = list(dsha256(l + r) for l, r in zip(*(iter(txids),) * 2))
     return txids[0]
 
+def merkle_root_from_coinbase_and_branch(
+    coinbase_tx: bytes,
+    branch: List[bytes],
+    index: int,
+) -> bytes:
+    """
+    coinbase_tx: raw coinbase tx bytes
+    branch: merkle branch as a list of sibling hashes (bytes, 32 each),
+            starting from the leaf level up toward the root.
+            Each hash should be the internal merkle hash form
+            (i.e. dsha256(tx) order, *not* reversed for display).
+    index: position of the coinbase tx in the block's tx array (0-based)
+
+    returns: merkle root (internal byte order)
+    """
+
+    # Start with the leaf hash = double-SHA256 of the coinbase tx bytes
+    h = dsha256(coinbase_tx)
+
+    # Walk up the tree
+    for sibling in branch:
+        if index % 2 == 0:
+            # we are a left node, sibling is right
+            h = dsha256(h + sibling)
+        else:
+            # we are a right node, sibling is left
+            h = dsha256(sibling + h)
+        index //= 2
+
+    return h
 
 class TemplateState:
     # These refer to the block that we are working on
@@ -94,6 +132,12 @@ class TemplateState:
     header: Optional[bytes] = None
     coinbase_tx: Optional[bytes] = None
     coinbase_txid: Optional[bytes] = None
+
+    coinb1: Optional[str] = None
+    extraNonce1: str = "00000000" # length 4
+    extraNonce2: str = "0000000000000000" # length 8
+    coinb2: Optional[str] = None
+    merkle_branch: List[str] = []
 
     current_commitment: Optional[str] = None
 
@@ -198,16 +242,10 @@ class StratumSession(RPCSession):
         return [None, self._state.bits_counter.to_bytes(2, "big").hex()]
 
     async def handle_authorize(self, username: str, password: str):
-        # The first address that connects is the one that is used
+        # Skip address validation, just extract worker name if present
         split = username.split(".")
-        address = split[0]
         if len(split) > 1:
             self.name = split[1]
-        addr_decoded = base58.b58decode_check(address)
-        if addr_decoded[0] != (111 if self._testnet else 60):
-            raise RPCError(20, f"Invalid address {address}")
-        if not self._state.pub_h160:
-            self._state.pub_h160 = addr_decoded[1:]
         return True
 
     async def handle_submit(
@@ -238,23 +276,31 @@ class StratumSession(RPCSession):
 
         if nonce_hex[:2].lower() == "0x":
             nonce_hex = nonce_hex[2:]
+     
         nonce_hex = bytes.fromhex(nonce_hex)[::-1].hex()
+
         if mixhash_hex[:2].lower() == "0x":
             mixhash_hex = mixhash_hex[2:]
         mixhash_hex = bytes.fromhex(mixhash_hex)[::-1].hex()
 
         block_hex = state.build_block(nonce_hex, mixhash_hex)
 
+        # Quai expects hex values with 0x prefix
+        if not block_hex.startswith("0x"):
+            block_hex = "0x" + block_hex
+
         data = {
             "jsonrpc": "2.0",
             "id": "0",
-            "method": "submitblock",
+            "method": "quai_submitBlock",
             "params": [block_hex],
         }
+        headers = {"Content-Type": "application/json"}
         async with ClientSession() as session:
             async with session.post(
                 f"http://{self._node_username}:{self._node_password}@{self._node_url}:{self._node_port}",
                 data=json.dumps(data),
+                headers=headers,
             ) as resp:
                 json_resp = await resp.json()
 
@@ -291,47 +337,44 @@ class StratumSession(RPCSession):
                 ):
                     raise RPCError(20, json_resp["result"])
 
-        # Get height from block hex
-        block_height = int.from_bytes(
-            bytes.fromhex(
-                block_hex[(4 + 32 + 32 + 4 + 4) * 2 : (4 + 32 + 32 + 4 + 4 + 4) * 2]
-            ),
-            "little",
-            signed=False,
-        )
-        msg = f"Found block (may or may not be accepted by the chain): {block_height}"
+        # Use the height from state directly
+        msg = f"Found block (may or may not be accepted by the chain): {state.height}"
         print(msg)
         await self.send_notification("client.show_message", (msg,))
+
+        # Immediately fetch new block template after submission
+        if self._verbose:
+            print("Fetching new block template after submission")
+        await stateUpdater(
+            self._state,
+            self._old_states,
+            20,  # drop_after - same as the store value in main
+            self._verbose,
+            self._node_url,
+            self._node_username,
+            self._node_password,
+            self._node_port,
+            force_update=True,  # Force new work even if height hasn't changed
+        )
 
         return True
 
     async def handle_eth_submitHashrate(self, hashrate: str, clientid: str):
-        # The clienid is a random hex string
-        data = {"jsonrpc": "2.0", "id": "0", "method": "getmininginfo", "params": []}
-        async with ClientSession() as session:
-            async with session.post(
-                f"http://{self._node_username}:{self._node_password}@{self._node_url}:{self._node_port}",
-                data=json.dumps(data),
-            ) as resp:
-                try:
-                    json_obj = await resp.json()
-                    if json_obj.get("error", None):
-                        raise Exception(json_obj.get("error", None))
+        """Record reported hashrate without querying the upstream node.
 
-                    blocks_int: int = json_obj["result"]["blocks"]
-                    difficulty_int: int = json_obj["result"]["difficulty"]
-                    networkhashps_int: int = json_obj["result"]["networkhashps"]
+        Quai's RPC doesn't expose getmininginfo, so the previous implementation
+        spammed the logs with JSONDecodeError. We simply track per-worker
+        hashrate locally and skip network statistics entirely.
+        """
 
-                except Exception as e:
-                    print("Failed to query mininginfo from node")
-                    import traceback
+        try:
+            hashrate_int = int(hashrate, 16)
+        except ValueError:
+            print("Received malformed hashrate payload, ignoring")
+            return
 
-                    traceback.print_exc()
-                    return
-
-        hashrate = int(hashrate, 16)
         worker = str(self).strip(">").split()[3]
-        hashratedict.update({worker: hashrate})
+        hashratedict.update({worker: hashrate_int})
         totalHashrate = 0
 
         print(f"----------------------------")
@@ -342,23 +385,15 @@ class StratumSession(RPCSession):
         print(f"----------------------------")
         print(f"Total Reported Hashrate: {round(totalHashrate / 1000000, 2)}Mh/s")
 
-        if testnet == True:
-            print(f"Network Hashrate: {round(networkhashps_int / 1000000, 2)}Mh/s")
-        else:
-            print(
-                f"Network Hashrate: {round(networkhashps_int / 1000000000000, 2)}Th/s"
-            )
-
-        if totalHashrate != 0:
-            TTF = difficulty_int * 2**32 / totalHashrate
-            if testnet == True:
-                msg = f"Estimated time to find: {round(TTF)} seconds"
-            else:
-                msg = f"Estimated time to find: {round(TTF / 86400, 2)} days"
-            print(msg)
-            await self.send_notification("client.show_message", (msg,))
-        else:
+        if totalHashrate == 0:
             print("Mining software has yet to send data")
+            return True
+
+        msg = (
+            "Estimated time to find: unavailable (network stats disabled)"
+        )
+        print(msg)
+        await self.send_notification("client.show_message", (msg,))
         return True
 
 
@@ -371,29 +406,65 @@ async def stateUpdater(
     node_username: str,
     node_password: str,
     node_port: int,
+    force_update: bool = False,
 ):
-    if not state.pub_h160:
-        return
-    data = {"jsonrpc": "2.0", "id": "0", "method": "getblocktemplate", "params": []}
+    data = {"jsonrpc": "2.0", "id": "0", "method": "quai_getBlockTemplate", "params": []}
+    headers = {"Content-Type": "application/json"}
     async with ClientSession() as session:
         async with session.post(
             f"http://{node_username}:{node_password}@{node_url}:{node_port}",
             data=json.dumps(data),
+            headers=headers,
         ) as resp:
             try:
-                json_obj = await resp.json()
+                if verbose:
+                    print(f"GetBlockTemplate response status: {resp.status}")
+                    print(f"GetBlockTemplate response content-type: {resp.content_type}")
+
+                # Try to get response text first to debug
+                response_text = await resp.text()
+                if verbose:
+                    print(f"GetBlockTemplate response: {response_text[:500]}")  # Print first 500 chars
+
+                json_obj = json.loads(response_text)
                 if json_obj.get("error", None):
                     raise Exception(json_obj.get("error", None))
 
-                version_int: int = json_obj["result"]["version"]
-                height_int: int = json_obj["result"]["height"]
+                version_int: int = int(json_obj["result"]["version"], 16) if isinstance(json_obj["result"]["version"], str) else json_obj["result"]["version"]
+                height_int: int = int(json_obj["result"]["height"], 16) if isinstance(json_obj["result"]["height"], str) else json_obj["result"]["height"]
                 bits_hex: str = json_obj["result"]["bits"]
+                if isinstance(bits_hex, str) and bits_hex.startswith("0x"):
+                    bits_hex = bits_hex[2:]
+                # Ensure bits_hex has even length for fromhex() and is 8 chars (4 bytes)
+                bits_hex = bits_hex.zfill(8)
+
+                if verbose:
+                    print(f"Parsed version: {version_int}, height: {height_int}, bits: {bits_hex}")
                 prev_hash_hex: str = json_obj["result"]["previousblockhash"]
-                txs_list: List = json_obj["result"]["transactions"]
-                coinbase_sats_int: int = json_obj["result"]["coinbasevalue"]
-                witness_hex: str = json_obj["result"]["default_witness_commitment"]
-                coinbase_flags_hex: str = json_obj["result"]["coinbaseaux"]["flags"]
+                if prev_hash_hex.startswith("0x"):
+                    prev_hash_hex = prev_hash_hex[2:]
+
+                # Quai format doesn't have transactions list, witness commitment, or nested coinbaseaux
+                txs_list: List = json_obj["result"].get("transactions", [])
+                witness_hex: str = json_obj["result"].get("default_witness_commitment", "")
+
                 target_hex: str = json_obj["result"]["target"]
+                if target_hex.startswith("0x"):
+                    target_hex = target_hex[2:]
+
+                merkle_branch: List = json_obj["result"].get("merkleBranch", [])
+                state.merkle_branch = [bytes.fromhex(h)[::-1] for h in merkle_branch]
+
+                coinb1: str = json_obj["result"].get("coinb1", "")
+                coinb2: str = json_obj["result"].get("coinb2", "")
+
+                if coinb1.startswith("0x"):
+                    coinb1 = coinb1[2:]
+                if coinb2.startswith("0x"):
+                    coinb2 = coinb2[2:]
+
+                state.coinb1 = coinb1
+                state.coinb2 = coinb2
 
                 ts = int(time.time())
                 new_witness = witness_hex != state.current_commitment
@@ -458,81 +529,22 @@ async def stateUpdater(
                     state.height = height_int
 
                 # The following occurs during both new blocks & new txs & nothing happens for 60s (magic number)
-                if new_block or new_witness or state.timestamp + 60 < ts:
+                # OR when force_update is True (e.g., after block submission)
+                if (
+                    new_block
+                    or new_witness
+                    or state.timestamp + 60 < ts
+                    or force_update
+                ):
                     # Generate coinbase #
 
                     if original_state is None:
                         original_state = deepcopy(state)
 
-                    bytes_needed_sub_1 = 0
-                    while True:
-                        if state.height <= (2 ** (7 + (8 * bytes_needed_sub_1))) - 1:
-                            break
-                        bytes_needed_sub_1 += 1
+                    # Create coinbase tx
+                    state.coinbase_tx = bytes.fromhex(state.coinb1) + bytes.fromhex(state.extraNonce1) + bytes.fromhex(state.extraNonce2) + bytes.fromhex(state.coinb2)
 
-                    bip34_height = state.height.to_bytes(
-                        bytes_needed_sub_1 + 1, "little"
-                    )
-
-                    # Note that there is a max allowed length of arbitrary data.
-                    # I forget what it is (TODO lol) but note that this string is close
-                    # to the max.
-                    arbitrary_data = b"with a little help from http://github.com/kralverde/ravencoin-stratum-proxy"
-                    coinbase_script = (
-                        op_push(len(bip34_height))
-                        + bip34_height
-                        + op_push(len(arbitrary_data))
-                        + arbitrary_data
-                    )
-                    coinbase_txin = (
-                        bytes(32)
-                        + b"\xff" * 4
-                        + var_int(len(coinbase_script))
-                        + coinbase_script
-                        + b"\xff" * 4
-                    )
-                    vout_to_miner = b"\x76\xa9\x14" + state.pub_h160 + b"\x88\xac"
-
-                    # Concerning the default_witness_commitment:
-                    # https://github.com/bitcoin/bips/blob/master/bip-0141.mediawiki#commitment-structure
-                    # Because the coinbase tx is '00'*32 in witness commit,
-                    # We can take what the node gives us directly without changing it
-                    # (This assumes that the txs are in the correct order, but I think
-                    # that is a safe assumption)
-
-                    witness_vout = bytes.fromhex(witness_hex)
-
-                    state.coinbase_tx = (
-                        int(1).to_bytes(4, "little")
-                        + b"\x00\x01"
-                        + b"\x01"
-                        + coinbase_txin
-                        + b"\x02"
-                        + coinbase_sats_int.to_bytes(8, "little")
-                        + op_push(len(vout_to_miner))
-                        + vout_to_miner
-                        + bytes(8)
-                        + op_push(len(witness_vout))
-                        + witness_vout
-                        + b"\x01\x20"
-                        + bytes(32)
-                        + bytes(4)
-                    )
-
-                    coinbase_no_wit = (
-                        int(1).to_bytes(4, "little")
-                        + b"\x01"
-                        + coinbase_txin
-                        + b"\x02"
-                        + coinbase_sats_int.to_bytes(8, "little")
-                        + op_push(len(vout_to_miner))
-                        + vout_to_miner
-                        + bytes(8)
-                        + op_push(len(witness_vout))
-                        + witness_vout
-                        + bytes(4)
-                    )
-                    state.coinbase_txid = dsha256(coinbase_no_wit)
+                    state.coinbase_txid = dsha256(state.coinbase_tx)
 
                     # Create merkle & update txs
                     txids = [state.coinbase_txid]
@@ -561,6 +573,14 @@ async def stateUpdater(
                     add_old_state_to_queue(old_states, original_state, drop_after)
 
                     for session in state.all_sessions:
+                        print(f"[NOTIFY] Sending mining.notify to existing session: {session}")
+                        print(f"  job_id: {hex(state.job_counter)[2:]}")
+                        print(f"  headerHash: {state.headerHash}")
+                        print(f"  seedHash: {state.seedHash.hex()}")
+                        print(f"  target: {target_hex}")
+                        print(f"  clean_jobs: True")
+                        print(f"  height: {state.height}")
+                        print(f"  bits: {bits_hex}")
                         await session.send_notification(
                             "mining.set_target", (target_hex,)
                         )
@@ -579,6 +599,14 @@ async def stateUpdater(
 
                 for session in state.new_sessions:
                     state.all_sessions.add(session)
+                    print(f"[NOTIFY] Sending mining.notify to NEW session: {session}")
+                    print(f"  job_id: {hex(state.job_counter)[2:]}")
+                    print(f"  headerHash: {state.headerHash}")
+                    print(f"  seedHash: {state.seedHash.hex()}")
+                    print(f"  target: {target_hex}")
+                    print(f"  clean_jobs: True")
+                    print(f"  height: {state.height}")
+                    print(f"  bits: {bits_hex}")
                     await session.send_notification("mining.set_target", (target_hex,))
                     await session.send_notification(
                         "mining.notify",
@@ -596,14 +624,14 @@ async def stateUpdater(
                 state.new_sessions.clear()
 
             except Exception as e:
-                print("Failed to query blocktemplate from node")
+                print(f"Failed to query blocktemplate from node: {e}")
                 import traceback
 
                 traceback.print_exc()
                 print(
-                    "Sleeping for 5 minutes.\nAny solutions found during this time may not be current.\nTry restarting the proxy."
+                    "Sleeping for 5 seconds before retry."
                 )
-                await asyncio.sleep(300)
+                await asyncio.sleep(5)
 
 
 if __name__ == "__main__":

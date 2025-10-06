@@ -7,7 +7,15 @@ import os
 import urllib.parse
 
 import base58
-import sha3
+try:
+    import sha3
+except ImportError:
+    # Fallback to pycryptodome if pysha3 is not available
+    from Crypto.Hash import keccak as sha3_module
+    class sha3:
+        @staticmethod
+        def keccak_256():
+            return sha3_module.new(digest_bits=256)
 
 from aiohttp import ClientSession
 from aiorpcx import (
@@ -96,6 +104,7 @@ class TemplateState:
     coinbase_txid: Optional[bytes] = None
 
     current_commitment: Optional[str] = None
+    coinbase_aux: Optional[str] = None
 
     new_sessions: Set[RPCSession] = set()
     all_sessions: Set[RPCSession] = set()
@@ -198,16 +207,10 @@ class StratumSession(RPCSession):
         return [None, self._state.bits_counter.to_bytes(2, "big").hex()]
 
     async def handle_authorize(self, username: str, password: str):
-        # The first address that connects is the one that is used
+        # Skip address validation, just extract worker name if present
         split = username.split(".")
-        address = split[0]
         if len(split) > 1:
             self.name = split[1]
-        addr_decoded = base58.b58decode_check(address)
-        if addr_decoded[0] != (111 if self._testnet else 60):
-            raise RPCError(20, f"Invalid address {address}")
-        if not self._state.pub_h160:
-            self._state.pub_h160 = addr_decoded[1:]
         return True
 
     async def handle_submit(
@@ -238,23 +241,38 @@ class StratumSession(RPCSession):
 
         if nonce_hex[:2].lower() == "0x":
             nonce_hex = nonce_hex[2:]
-        nonce_hex = bytes.fromhex(nonce_hex)[::-1].hex()
+        # Nonce: convert to 8-byte little-endian
+        nonce_int = int(nonce_hex, 16)
+        nonce_hex = nonce_int.to_bytes(8, 'little').hex()
+
         if mixhash_hex[:2].lower() == "0x":
             mixhash_hex = mixhash_hex[2:]
-        mixhash_hex = bytes.fromhex(mixhash_hex)[::-1].hex()
+        # MixHash: KawPOW uses big-endian, don't reverse
+        # Ensure it's 32 bytes
+        mixhash_hex = mixhash_hex.zfill(64)
+
+        if self._verbose:
+            print(f"Submit - nonce_hex: {nonce_hex}, mixhash_hex: {mixhash_hex}")
+            print(f"Submit - nonce_int: {nonce_int}, header_hash: {state.headerHash}")
 
         block_hex = state.build_block(nonce_hex, mixhash_hex)
+
+        # Quai expects hex values with 0x prefix
+        if not block_hex.startswith("0x"):
+            block_hex = "0x" + block_hex
 
         data = {
             "jsonrpc": "2.0",
             "id": "0",
-            "method": "submitblock",
+            "method": "quai_submitBlock",
             "params": [block_hex],
         }
+        headers = {"Content-Type": "application/json"}
         async with ClientSession() as session:
             async with session.post(
                 f"http://{self._node_username}:{self._node_password}@{self._node_url}:{self._node_port}",
                 data=json.dumps(data),
+                headers=headers,
             ) as resp:
                 json_resp = await resp.json()
 
@@ -306,32 +324,21 @@ class StratumSession(RPCSession):
         return True
 
     async def handle_eth_submitHashrate(self, hashrate: str, clientid: str):
-        # The clienid is a random hex string
-        data = {"jsonrpc": "2.0", "id": "0", "method": "getmininginfo", "params": []}
-        async with ClientSession() as session:
-            async with session.post(
-                f"http://{self._node_username}:{self._node_password}@{self._node_url}:{self._node_port}",
-                data=json.dumps(data),
-            ) as resp:
-                try:
-                    json_obj = await resp.json()
-                    if json_obj.get("error", None):
-                        raise Exception(json_obj.get("error", None))
+        """Record reported hashrate without querying the upstream node.
 
-                    blocks_int: int = json_obj["result"]["blocks"]
-                    difficulty_int: int = json_obj["result"]["difficulty"]
-                    networkhashps_int: int = json_obj["result"]["networkhashps"]
+        Quai's RPC doesn't expose getmininginfo, so the previous implementation
+        spammed the logs with JSONDecodeError. We simply track per-worker
+        hashrate locally and skip network statistics entirely.
+        """
 
-                except Exception as e:
-                    print("Failed to query mininginfo from node")
-                    import traceback
+        try:
+            hashrate_int = int(hashrate, 16)
+        except ValueError:
+            print("Received malformed hashrate payload, ignoring")
+            return
 
-                    traceback.print_exc()
-                    return
-
-        hashrate = int(hashrate, 16)
         worker = str(self).strip(">").split()[3]
-        hashratedict.update({worker: hashrate})
+        hashratedict.update({worker: hashrate_int})
         totalHashrate = 0
 
         print(f"----------------------------")
@@ -342,23 +349,15 @@ class StratumSession(RPCSession):
         print(f"----------------------------")
         print(f"Total Reported Hashrate: {round(totalHashrate / 1000000, 2)}Mh/s")
 
-        if testnet == True:
-            print(f"Network Hashrate: {round(networkhashps_int / 1000000, 2)}Mh/s")
-        else:
-            print(
-                f"Network Hashrate: {round(networkhashps_int / 1000000000000, 2)}Th/s"
-            )
-
-        if totalHashrate != 0:
-            TTF = difficulty_int * 2**32 / totalHashrate
-            if testnet == True:
-                msg = f"Estimated time to find: {round(TTF)} seconds"
-            else:
-                msg = f"Estimated time to find: {round(TTF / 86400, 2)} days"
-            print(msg)
-            await self.send_notification("client.show_message", (msg,))
-        else:
+        if totalHashrate == 0:
             print("Mining software has yet to send data")
+            return True
+
+        msg = (
+            "Estimated time to find: unavailable (network stats disabled)"
+        )
+        print(msg)
+        await self.send_notification("client.show_message", (msg,))
         return True
 
 
@@ -372,32 +371,59 @@ async def stateUpdater(
     node_password: str,
     node_port: int,
 ):
-    if not state.pub_h160:
-        return
-    data = {"jsonrpc": "2.0", "id": "0", "method": "getblocktemplate", "params": []}
+    data = {"jsonrpc": "2.0", "id": "0", "method": "quai_getBlockTemplate", "params": []}
+    headers = {"Content-Type": "application/json"}
     async with ClientSession() as session:
         async with session.post(
             f"http://{node_username}:{node_password}@{node_url}:{node_port}",
             data=json.dumps(data),
+            headers=headers,
         ) as resp:
             try:
-                json_obj = await resp.json()
+                if verbose:
+                    print(f"GetBlockTemplate response status: {resp.status}")
+                    print(f"GetBlockTemplate response content-type: {resp.content_type}")
+
+                # Try to get response text first to debug
+                response_text = await resp.text()
+                if verbose:
+                    print(f"GetBlockTemplate response: {response_text[:500]}")  # Print first 500 chars
+
+                json_obj = json.loads(response_text)
                 if json_obj.get("error", None):
                     raise Exception(json_obj.get("error", None))
 
-                version_int: int = json_obj["result"]["version"]
-                height_int: int = json_obj["result"]["height"]
+                version_int: int = int(json_obj["result"]["version"], 16) if isinstance(json_obj["result"]["version"], str) else json_obj["result"]["version"]
+                height_int: int = int(json_obj["result"]["height"], 16) if isinstance(json_obj["result"]["height"], str) else json_obj["result"]["height"]
                 bits_hex: str = json_obj["result"]["bits"]
+                if isinstance(bits_hex, str) and bits_hex.startswith("0x"):
+                    bits_hex = bits_hex[2:]
+                # Ensure bits_hex has even length for fromhex() and is 8 chars (4 bytes)
+                bits_hex = bits_hex.zfill(8)
+
+                if verbose:
+                    print(f"Parsed version: {version_int}, height: {height_int}, bits: {bits_hex}")
                 prev_hash_hex: str = json_obj["result"]["previousblockhash"]
-                txs_list: List = json_obj["result"]["transactions"]
-                coinbase_sats_int: int = json_obj["result"]["coinbasevalue"]
-                witness_hex: str = json_obj["result"]["default_witness_commitment"]
-                coinbase_flags_hex: str = json_obj["result"]["coinbaseaux"]["flags"]
+                if prev_hash_hex.startswith("0x"):
+                    prev_hash_hex = prev_hash_hex[2:]
+
+                # Quai format doesn't have transactions list, witness commitment, or nested coinbaseaux
+                txs_list: List = json_obj["result"].get("transactions", [])
+                coinbase_sats_int: int = int(json_obj["result"]["coinbasevalue"], 16) if isinstance(json_obj["result"]["coinbasevalue"], str) else json_obj["result"]["coinbasevalue"]
+                witness_hex: str = json_obj["result"].get("default_witness_commitment", "")
+                coinbase_aux_hex: str = json_obj["result"]["coinbaseaux"]
+                if coinbase_aux_hex.startswith("0x"):
+                    coinbase_aux_hex = coinbase_aux_hex[2:]
                 target_hex: str = json_obj["result"]["target"]
+                if target_hex.startswith("0x"):
+                    target_hex = target_hex[2:]
+                merkle_branch: List = json_obj["result"].get("merkleBranch", [])
 
                 ts = int(time.time())
                 new_witness = witness_hex != state.current_commitment
                 state.current_commitment = witness_hex
+                new_coinbase_aux = coinbase_aux_hex != state.coinbase_aux
+                state.coinbase_aux = coinbase_aux_hex
                 state.target = target_hex
                 state.bits = bits_hex
                 state.version = version_int
@@ -458,7 +484,7 @@ async def stateUpdater(
                     state.height = height_int
 
                 # The following occurs during both new blocks & new txs & nothing happens for 60s (magic number)
-                if new_block or new_witness or state.timestamp + 60 < ts:
+                if new_block or new_witness or new_coinbase_aux or state.timestamp + 60 < ts:
                     # Generate coinbase #
 
                     if original_state is None:
@@ -474,16 +500,7 @@ async def stateUpdater(
                         bytes_needed_sub_1 + 1, "little"
                     )
 
-                    # Note that there is a max allowed length of arbitrary data.
-                    # I forget what it is (TODO lol) but note that this string is close
-                    # to the max.
-                    arbitrary_data = b"with a little help from http://github.com/kralverde/ravencoin-stratum-proxy"
-                    coinbase_script = (
-                        op_push(len(bip34_height))
-                        + bip34_height
-                        + op_push(len(arbitrary_data))
-                        + arbitrary_data
-                    )
+                    coinbase_script = op_push(len(bip34_height)) + bip34_height
                     coinbase_txin = (
                         bytes(32)
                         + b"\xff" * 4
@@ -491,7 +508,15 @@ async def stateUpdater(
                         + coinbase_script
                         + b"\xff" * 4
                     )
-                    vout_to_miner = b"\x76\xa9\x14" + state.pub_h160 + b"\x88\xac"
+                    # Treat coinbaseaux as a complete payout script when provided.
+                    # Fall back to a P2PKH script using the first miner address (or
+                    # zeros) so the subsidy always lands somewhere spendable.
+                    payout_script = None
+                    if coinbase_aux_hex:
+                        try:
+                            payout_script = bytes.fromhex(coinbase_aux_hex)
+                        except ValueError:
+                            payout_script = None
 
                     # Concerning the default_witness_commitment:
                     # https://github.com/bitcoin/bips/blob/master/bip-0141.mediawiki#commitment-structure
@@ -509,8 +534,8 @@ async def stateUpdater(
                         + coinbase_txin
                         + b"\x02"
                         + coinbase_sats_int.to_bytes(8, "little")
-                        + op_push(len(vout_to_miner))
-                        + vout_to_miner
+                        + op_push(len(payout_script))
+                        + payout_script
                         + bytes(8)
                         + op_push(len(witness_vout))
                         + witness_vout
@@ -525,8 +550,8 @@ async def stateUpdater(
                         + coinbase_txin
                         + b"\x02"
                         + coinbase_sats_int.to_bytes(8, "little")
-                        + op_push(len(vout_to_miner))
-                        + vout_to_miner
+                        + op_push(len(payout_script))
+                        + payout_script
                         + bytes(8)
                         + op_push(len(witness_vout))
                         + witness_vout
@@ -554,13 +579,23 @@ async def stateUpdater(
                         + state.height.to_bytes(4, "little")
                     )
 
-                    state.headerHash = dsha256(state.header)[::-1].hex()
+                    # For Quai/KawPOW, don't reverse the header hash
+                    # (Ravencoin reverses it, but Quai uses it as-is)
+                    state.headerHash = dsha256(state.header).hex()
                     state.timestamp = ts
 
                     state.job_counter += 1
                     add_old_state_to_queue(old_states, original_state, drop_after)
 
                     for session in state.all_sessions:
+                        print(f"[NOTIFY] Sending mining.notify to existing session: {session}")
+                        print(f"  job_id: {hex(state.job_counter)[2:]}")
+                        print(f"  headerHash: {state.headerHash}")
+                        print(f"  seedHash: {state.seedHash.hex()}")
+                        print(f"  target: {target_hex}")
+                        print(f"  clean_jobs: True")
+                        print(f"  height: {state.height}")
+                        print(f"  bits: {bits_hex}")
                         await session.send_notification(
                             "mining.set_target", (target_hex,)
                         )
@@ -579,6 +614,14 @@ async def stateUpdater(
 
                 for session in state.new_sessions:
                     state.all_sessions.add(session)
+                    print(f"[NOTIFY] Sending mining.notify to NEW session: {session}")
+                    print(f"  job_id: {hex(state.job_counter)[2:]}")
+                    print(f"  headerHash: {state.headerHash}")
+                    print(f"  seedHash: {state.seedHash.hex()}")
+                    print(f"  target: {target_hex}")
+                    print(f"  clean_jobs: True")
+                    print(f"  height: {state.height}")
+                    print(f"  bits: {bits_hex}")
                     await session.send_notification("mining.set_target", (target_hex,))
                     await session.send_notification(
                         "mining.notify",
@@ -596,14 +639,14 @@ async def stateUpdater(
                 state.new_sessions.clear()
 
             except Exception as e:
-                print("Failed to query blocktemplate from node")
+                print(f"Failed to query blocktemplate from node: {e}")
                 import traceback
 
                 traceback.print_exc()
                 print(
-                    "Sleeping for 5 minutes.\nAny solutions found during this time may not be current.\nTry restarting the proxy."
+                    "Sleeping for 5 seconds before retry."
                 )
-                await asyncio.sleep(300)
+                await asyncio.sleep(5)
 
 
 if __name__ == "__main__":

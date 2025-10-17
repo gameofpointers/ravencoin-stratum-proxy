@@ -248,7 +248,6 @@ class StratumSession(RPCSession):
 
         if mixhash_hex[:2].lower() == "0x":
             mixhash_hex = mixhash_hex[2:]
-        # MixHash: KawPOW uses big-endian, don't reverse
         # Ensure it's 32 bytes
         mixhash_hex = mixhash_hex.zfill(64)
 
@@ -422,6 +421,15 @@ async def stateUpdater(
                     payout_script_hex = ""
                 if payout_script_hex.startswith("0x"):
                     payout_script_hex = payout_script_hex[2:]
+
+                # If payout script is empty, use a default P2PKH script
+                # This is a placeholder - miners should configure their own address
+                if not payout_script_hex or payout_script_hex == "":
+                    # Default to a burn address script: OP_DUP OP_HASH160 <20 zeros> OP_EQUALVERIFY OP_CHECKSIG
+                    payout_script_hex = "76a914" + "00" * 20 + "88ac"
+                    if verbose:
+                        print(f"WARNING: Using default payout script (burn address). Configure proper payout address!")
+
                 target_hex: str = json_obj["result"]["target"]
                 if target_hex.startswith("0x"):
                     target_hex = target_hex[2:]
@@ -540,39 +548,23 @@ async def stateUpdater(
                     # (This assumes that the txs are in the correct order, but I think
                     # that is a safe assumption)
 
-                    witness_vout = bytes.fromhex(witness_hex)
+                    # Build coinbase for Ravencoin (no witness commitment needed)
+                    # For Ravencoin, we only need one output - the payout to the miner
+                    coinbase_outputs = (
+                        b"\x01"  # Output count = 1
+                        + coinbase_sats_int.to_bytes(8, "little")  # Amount
+                        + var_int(len(payout_script))  # Script length
+                        + payout_script  # Payout script
+                    )
 
                     state.coinbase_tx = (
-                        int(1).to_bytes(4, "little")
-                        + b"\x00\x01"
-                        + b"\x01"
-                        + coinbase_txin
-                        + b"\x02"
-                        + coinbase_sats_int.to_bytes(8, "little")
-                        + op_push(len(payout_script))
-                        + payout_script
-                        + bytes(8)
-                        + op_push(len(witness_vout))
-                        + witness_vout
-                        + b"\x01\x20"
-                        + bytes(32)
-                        + bytes(4)
+                        int(1).to_bytes(4, "little")  # Version
+                        + b"\x01"  # Input count = 1
+                        + coinbase_txin  # Coinbase input
+                        + coinbase_outputs  # Outputs
+                        + bytes(4)  # Lock time
                     )
-
-                    coinbase_no_wit = (
-                        int(1).to_bytes(4, "little")
-                        + b"\x01"
-                        + coinbase_txin
-                        + b"\x02"
-                        + coinbase_sats_int.to_bytes(8, "little")
-                        + op_push(len(payout_script))
-                        + payout_script
-                        + bytes(8)
-                        + op_push(len(witness_vout))
-                        + witness_vout
-                        + bytes(4)
-                    )
-                    state.coinbase_txid = dsha256(coinbase_no_wit)
+                    state.coinbase_txid = dsha256(state.coinbase_tx)
 
                     # Create merkle & update txs
                     txids = [state.coinbase_txid]

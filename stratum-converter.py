@@ -318,8 +318,31 @@ class StratumSession(RPCSession):
                     raise RPCError(20, json_resp["error"])
 
                 result = json_resp.get("result", None)
+
+                if isinstance(result, str):
+                    print("result", len(result))
+                else:
+                    print("result", result)
+
+                allowed_statuses = (
+                    "inconclusive",
+                    "duplicate",
+                    "duplicate-inconclusive",
+                    "inconclusive-not-best-prevblk",
+                )
+
+                is_block_hash = isinstance(result, str) and result.startswith("0x") and len(result) == 66
+
+                if not is_block_hash and result not in (
+                    None,
+                    *allowed_statuses,
+                ):
+                    raise RPCError(20, json_resp["result"])
+
                 if self._verbose:
-                    if result == "inconclusive":
+                    if is_block_hash:
+                        print(f"Upstream accepted block hash {result}")
+                    elif result == "inconclusive":
                         # inconclusive - valid submission but other block may be better, etc.
                         print("Valid block but inconclusive")
                     elif result == "duplicate":
@@ -328,15 +351,6 @@ class StratumSession(RPCSession):
                         print("Valid block but duplicate-inconclusive")
                     elif result == "inconclusive-not-best-prevblk":
                         print("Valid block but inconclusive-not-best-prevblk")
-
-                if result not in (
-                    None,
-                    "inconclusive",
-                    "duplicate",
-                    "duplicate-inconclusive",
-                    "inconclusive-not-best-prevblk",
-                ):
-                    raise RPCError(20, json_resp["result"])
 
         # Use the height from state directly
         msg = f"Found block (may or may not be accepted by the chain): {state.height}"

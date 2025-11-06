@@ -320,7 +320,7 @@ class StratumSession(RPCSession):
                 result = json_resp.get("result", None)
 
                 if isinstance(result, str):
-                    print("result", len(result))
+                    print("result (len)", len(result))
                 else:
                     print("result", result)
 
@@ -332,8 +332,13 @@ class StratumSession(RPCSession):
                 )
 
                 is_block_hash = isinstance(result, str) and result.startswith("0x") and len(result) == 66
+                is_block_dict = isinstance(result, dict) and (
+                    ("hash" in result and isinstance(result["hash"], str))
+                    or ("number" in result and isinstance(result["number"], str))
+                )
+                is_block_success = is_block_hash or is_block_dict
 
-                if not is_block_hash and result not in (
+                if not is_block_success and result not in (
                     None,
                     *allowed_statuses,
                 ):
@@ -342,6 +347,10 @@ class StratumSession(RPCSession):
                 if self._verbose:
                     if is_block_hash:
                         print(f"Upstream accepted block hash {result}")
+                    elif is_block_dict:
+                        hash_val = result.get("hash")
+                        number_val = result.get("number")
+                        print(f"Upstream accepted block result hash={hash_val} number={number_val}")
                     elif result == "inconclusive":
                         # inconclusive - valid submission but other block may be better, etc.
                         print("Valid block but inconclusive")

@@ -335,6 +335,7 @@ class StratumSession(RPCSession):
                 is_block_dict = isinstance(result, dict) and (
                     ("hash" in result and isinstance(result["hash"], str))
                     or ("number" in result and isinstance(result["number"], str))
+                    or ("status" in result and isinstance(result["status"], str))
                 )
                 is_block_success = is_block_hash or is_block_dict
 

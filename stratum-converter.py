@@ -470,15 +470,19 @@ async def stateUpdater(
                     prev_hash_hex = prev_hash_hex[2:]
 
                 # Quai format doesn't have transactions list, witness commitment, or nested coinbaseaux
-                txs_list: List = json_obj["result"].get("transactions", [])
                 witness_hex: str = json_obj["result"].get("default_witness_commitment", "")
 
                 target_hex: str = json_obj["result"]["target"]
                 if target_hex.startswith("0x"):
                     target_hex = target_hex[2:]
 
-                merkle_branch: List = json_obj["result"].get("merkleBranch", [])
-                state.merkle_branch = [bytes.fromhex(h)[::-1] for h in merkle_branch]
+                merkle_branch: List = json_obj["result"].get("merklebranch", [])
+                parsed_branch: List[bytes] = []
+                for h in merkle_branch:
+                    if isinstance(h, str) and h.startswith(("0x", "0X")):
+                        h = h[2:]
+                    parsed_branch.append(bytes.fromhex(h)[::-1])
+                state.merkle_branch = parsed_branch
 
                 coinb1: str = json_obj["result"].get("coinb1", "")
                 coinb2: str = json_obj["result"].get("coinb2", "")
@@ -571,14 +575,11 @@ async def stateUpdater(
 
                     state.coinbase_txid = dsha256(state.coinbase_tx)
 
-                    # Create merkle & update txs
-                    txids = [state.coinbase_txid]
-                    incoming_txs = []
-                    for tx_data in txs_list:
-                        incoming_txs.append(tx_data["data"])
-                        txids.append(bytes.fromhex(tx_data["txid"])[::-1])
-                    state.externalTxs = incoming_txs
-                    merkle = merkle_from_txids(txids)
+                    merkle = merkle_root_from_coinbase_and_branch(
+                        state.coinbase_tx,
+                        state.merkle_branch,
+                        0
+                    )
 
                     # Done create merkle & update txs
 

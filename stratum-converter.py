@@ -22,6 +22,7 @@ from aiorpcx import (
     RPCSession,
     JSONRPCConnection,
     JSONRPCAutoDetect,
+    JSONRPCLoose,
     Request,
     serve_rs,
     handler_invocation,
@@ -191,7 +192,7 @@ class StratumSession(RPCSession):
         node_port: int,
         transport,
     ):
-        connection = JSONRPCConnection(JSONRPCAutoDetect)
+        connection = JSONRPCConnection(JSONRPCLoose)
         super().__init__(transport, connection=connection)
         self._state = state
         self._testnet = testnet
